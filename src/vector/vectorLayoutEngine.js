@@ -1,6 +1,7 @@
 // Vector-only layout engine - NO RASTERIZATION
 import PDFLib from 'pdf-lib';
 import fs from 'fs/promises';
+import fsSync from 'fs';
 import os from 'os';
 import path from 'path';
 import { spawn } from 'child_process';
@@ -241,71 +242,115 @@ export const probeInkscape = async () => {
   }
 };
 
-const inkscapeSvgToPdfBytes = async (svgContent) => {
+const inkscapePipeToPdfBytes = async ({ writeToStdin }) => {
   if (!await probeInkscape()) {
     throw new Error('INKSCAPE_UNAVAILABLE: Inkscape is unavailable. SVG→PDF rendering is disabled.');
   }
 
-  const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'vector-svg-'));
-  const inputSvgPath = path.join(tmpDir, 'input.svg');
-  const outputPdfPath = path.join(tmpDir, 'output.pdf');
+  if (INKSCAPE_PROBED && INKSCAPE_AVAILABLE === false) {
+    throw new Error(
+      `INKSCAPE_UNAVAILABLE: Inkscape is unavailable. SVG→PDF rendering is disabled. (resolved bin: "${INKSCAPE_BIN_RESOLVED || resolveInkscapeBin()}")`
+    );
+  }
 
-  try {
-    await fs.writeFile(inputSvgPath, svgContent, 'utf8');
+  const bin = resolveInkscapeBin();
+  const args = [
+    '--pipe',
+    '--export-type=pdf',
+    '--export-area-page',
+    '--export-filename=-',
+  ];
 
-    if (INKSCAPE_PROBED && INKSCAPE_AVAILABLE === false) {
-      throw new Error(
-        `INKSCAPE_UNAVAILABLE: Inkscape is unavailable. SVG→PDF rendering is disabled. (resolved bin: "${INKSCAPE_BIN_RESOLVED || resolveInkscapeBin()}")`
-      );
-    }
+  const timeoutMs = Math.max(5000, Number(process.env.INKSCAPE_TIMEOUT_MS || 120000));
 
-    const bin = resolveInkscapeBin();
-    const args = [
-      inputSvgPath,
-      '--export-type=pdf',
-      '--export-area-page',
-      `--export-filename=${outputPdfPath}`,
-    ];
+  return new Promise((resolve, reject) => {
+    const p = spawn(bin, args, { stdio: ['pipe', 'pipe', 'pipe'] });
+    const stdoutChunks = [];
+    const stderrChunks = [];
 
-    await new Promise((resolve, reject) => {
-      const p = spawn(bin, args, { stdio: 'ignore' });
-      p.on('error', (err) => {
-        if (err && err.code === 'ENOENT') {
-          INKSCAPE_AVAILABLE = false;
-          INKSCAPE_PROBED = true;
-          INKSCAPE_BIN_RESOLVED = bin;
-          return reject(
-            new Error(
-              `INKSCAPE_NOT_FOUND: Failed to spawn inkscape binary "${bin}". Install Inkscape and ensure it is in PATH, or set INKSCAPE_PATH (preferred) / INKSCAPE_BIN to the full inkscape executable path.`
-            )
-          );
-        }
-        return reject(err);
-      });
-      p.on('exit', (code) => {
-        if (code === 0) {
-          INKSCAPE_AVAILABLE = true;
-          INKSCAPE_PROBED = true;
-          INKSCAPE_BIN_RESOLVED = bin;
-          return resolve();
-        }
-        return reject(new Error(`Inkscape SVG→PDF failed: ${code}`));
-      });
+    let settled = false;
+    const settle = (fn, value) => {
+      if (settled) return;
+      settled = true;
+      try { clearTimeout(timer); } catch {}
+      return fn(value);
+    };
+
+    const timer = setTimeout(() => {
+      try { p.kill('SIGKILL'); } catch {}
+      settle(reject, new Error('INKSCAPE_TIMEOUT: Inkscape render exceeded time budget'));
+    }, timeoutMs);
+
+    p.on('error', (err) => {
+      if (err && err.code === 'ENOENT') {
+        INKSCAPE_AVAILABLE = false;
+        INKSCAPE_PROBED = true;
+        INKSCAPE_BIN_RESOLVED = bin;
+        return settle(
+          reject,
+          new Error(
+            `INKSCAPE_NOT_FOUND: Failed to spawn inkscape binary "${bin}". Install Inkscape and ensure it is in PATH, or set INKSCAPE_PATH (preferred) / INKSCAPE_BIN to the full inkscape executable path.`
+          )
+        );
+      }
+      return settle(reject, err);
     });
 
-    const pdfBytes = await fs.readFile(outputPdfPath);
-    return pdfBytes;
-  } finally {
+    p.stdout.on('data', (d) => stdoutChunks.push(d));
+    p.stderr.on('data', (d) => stderrChunks.push(d));
+
+    p.on('exit', (code) => {
+      if (code === 0) {
+        INKSCAPE_AVAILABLE = true;
+        INKSCAPE_PROBED = true;
+        INKSCAPE_BIN_RESOLVED = bin;
+        const out = Buffer.concat(stdoutChunks);
+        return settle(resolve, out);
+      }
+      const stderr = Buffer.concat(stderrChunks).toString('utf8');
+      return settle(reject, new Error(`Inkscape SVG→PDF failed: ${code}${stderr ? ` (${stderr.slice(0, 400)})` : ''}`));
+    });
+
     try {
-      await fs.rm(tmpDir, { recursive: true, force: true });
-    } catch {
-      // ignore
+      writeToStdin(p.stdin);
+    } catch (e) {
+      try { p.kill('SIGKILL'); } catch {}
+      return settle(reject, e);
     }
-  }
+  });
+};
+
+const inkscapeSvgToPdfBytes = async (svgContent) => {
+  const buf = Buffer.isBuffer(svgContent) ? svgContent : Buffer.from(String(svgContent || ''), 'utf8');
+  return inkscapePipeToPdfBytes({
+    writeToStdin: (stdin) => {
+      stdin.write(buf);
+      stdin.end();
+    },
+  });
+};
+
+export const svgPathToPdfBytes = async (svgPath) => {
+  const p = typeof svgPath === 'string' ? svgPath : '';
+  if (!p) throw new Error('SVG_PATH_REQUIRED');
+  return inkscapePipeToPdfBytes({
+    writeToStdin: (stdin) => {
+      const rs = fsSync.createReadStream(p);
+      rs.on('error', (err) => {
+        try { stdin.destroy(err); } catch {}
+      });
+      rs.pipe(stdin);
+    },
+  });
 };
 
 export const svgBytesToPdfBytes = async (bytes) => {
-  const raw = Buffer.isBuffer(bytes) ? bytes.toString('utf8') : Buffer.from(bytes).toString('utf8');
+  const buf = Buffer.isBuffer(bytes) ? bytes : Buffer.from(bytes);
+  const maxSync = Math.max(0, Number(process.env.SVG_SYNC_PARSE_MAX_BYTES || 5 * 1024 * 1024));
+  if (maxSync > 0 && buf.length > maxSync) {
+    return inkscapeSvgToPdfBytes(buf);
+  }
+  const raw = buf.toString('utf8');
   const normalized = normalizeSvgToA4(raw);
   const injected = injectNonScalingStroke(normalized);
   return inkscapeSvgToPdfBytes(injected);

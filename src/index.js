@@ -130,6 +130,9 @@ async function start() {
     console.log(`Backend listening on port ${PORT}`);
   });
 
+  server.keepAliveTimeout = 120000;
+  server.headersTimeout = 120000;
+
   server.on('clientError', (err, socket) => {
     if (err?.code === 'ECONNRESET' || err?.code === 'EPIPE') {
       try { socket.destroy(); } catch {}

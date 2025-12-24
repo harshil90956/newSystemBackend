@@ -1,18 +1,205 @@
 import { FlowProducer, Worker } from 'bullmq';
 import { connection, VECTOR_PDF_QUEUE_NAME } from '../../queues/vectorQueue.js';
 import VectorPrintJob from '../vectorModels/VectorPrintJob.js';
+import VectorDocument from '../vectorModels/VectorDocument.js';
+import VectorDocumentAccess from '../vectorModels/VectorDocumentAccess.js';
+import VectorDocumentJobs from '../vectorModels/VectorDocumentJobs.js';
 import { validateVectorMetadata } from '../vector/validation.js';
-import { vectorLayoutEngine } from '../vector/vectorLayoutEngine.js';
+import { vectorLayoutEngine, svgPathToPdfBytes } from '../vector/vectorLayoutEngine.js';
 import { uploadToS3WithKey } from '../services/s3.js';
+import { s3 } from '../services/s3.js';
 import { verifyJobPayload } from '../services/hmac.js';
 import { getRedisClient } from '../services/redisClient.js';
 import PDFLib from 'pdf-lib';
 import crypto from 'crypto';
+import fs from 'fs/promises';
+import fsSync from 'fs';
+import { PutObjectCommand } from '@aws-sdk/client-s3';
 
 let vectorFlowProducer = null;
 let warnedRedisUnavailable = false;
 let workersStarted = false;
 let startedWorkers = [];
+
+const generateSessionToken = () => crypto.randomBytes(32).toString('hex');
+
+const desiredSvgWorkersForBytes = (sizeBytes) => {
+  const n = Number(sizeBytes);
+  if (!Number.isFinite(n) || n <= 0) return 3;
+  const mb = n / (1024 * 1024);
+  if (mb >= 100) return 6;
+  if (mb >= 50) return 4;
+  return 3;
+};
+
+const createWorkerInstance = (idx) => {
+  return new Worker(
+    VECTOR_PDF_QUEUE_NAME,
+    async (job) => {
+      if (job.name === 'page') return processPage(job);
+      if (job.name === 'batch') return processBatch(job);
+      if (job.name === 'merge') return processMerge(job);
+      if (job.name === 'svg-upload') return processSvgUpload(job);
+      throw new Error(`Unknown job type: ${job.name}`);
+    },
+    { connection, concurrency: 1 }
+  );
+};
+
+const ensureSvgWorkerPool = (desiredCount) => {
+  if (!workersStarted) return;
+  const target = Math.max(1, Math.min(6, Number(desiredCount || 1)));
+  while (startedWorkers.length < target) {
+    const idx = startedWorkers.length;
+    let worker = null;
+    try {
+      worker = createWorkerInstance(idx);
+    } catch {
+      if (!warnedRedisUnavailable) {
+        warnedRedisUnavailable = true;
+        console.warn('[vectorPdfWorker] Redis unavailable: BullMQ workers not started');
+      }
+      return;
+    }
+
+    worker.on('failed', async (job, err) => {
+      if (job?.name === 'svg-upload') {
+        const documentJobId = job?.data?.documentJobId;
+        if (!documentJobId) return;
+        const jobDoc = await VectorDocumentJobs.findById(documentJobId).exec().catch(() => null);
+        if (!jobDoc) return;
+        jobDoc.status = 'failed';
+        jobDoc.stage = 'failed';
+        jobDoc.layoutPages = Array.isArray(jobDoc.layoutPages) ? jobDoc.layoutPages : [];
+        jobDoc.layoutPages.push({ type: 'svg-upload-failed', message: err?.message || 'failed' });
+        await jobDoc.save().catch(() => {});
+        return;
+      }
+
+      const printJobId = job?.data?.printJobId;
+      if (!printJobId) return;
+
+      const attempts = Number(job?.opts?.attempts || 1);
+      const attemptsMade = Number(job?.attemptsMade || 0);
+      const isFinalFailure = attemptsMade >= attempts;
+
+      const jobDoc = await VectorPrintJob.findById(printJobId).exec().catch(() => null);
+      if (!jobDoc) return;
+
+      jobDoc.status = 'FAILED';
+      jobDoc.error = { message: err?.message || 'Job failed', stack: err?.stack || null };
+      jobDoc.audit.push({ event: 'JOB_FAILED', details: { bullmqJobId: job.id, name: job.name } });
+      await jobDoc.save();
+
+      if (isFinalFailure) {
+        const documentId = String(
+          jobDoc?.metadata?.documentId || jobDoc?.metadata?.sourcePdfKey || jobDoc?.sourcePdfKey || ''
+        ).trim();
+        await releaseRenderLock({ documentId, printJobId: String(printJobId) });
+        console.log(
+          JSON.stringify({
+            phase: 'fail',
+            event: 'VECTOR_JOB_FAILED',
+            documentId,
+            jobId: String(printJobId),
+            jobName: job?.name,
+          })
+        );
+      }
+    });
+
+    worker.on('ready', () => {
+      console.log(`[VectorWorker-${idx + 1}] Connected and ready for jobs`);
+    });
+
+    startedWorkers.push(worker);
+  }
+};
+
+const processSvgUpload = async (job) => {
+  const { documentJobId, svgPath, title, totalPrints, userId, email, ticketCropMm } = job.data || {};
+
+  const bucket = process.env.AWS_S3_BUCKET;
+  if (!bucket) {
+    throw new Error('AWS_S3_BUCKET not configured');
+  }
+  if (!documentJobId || !svgPath || !userId || !email || !title) {
+    throw new Error('Invalid svg-upload payload');
+  }
+
+  let jobDoc = null;
+  try {
+    const st = await fs.stat(svgPath);
+    ensureSvgWorkerPool(desiredSvgWorkersForBytes(st.size));
+
+    jobDoc = await VectorDocumentJobs.findById(documentJobId).exec();
+    if (!jobDoc) throw new Error('DocumentJob not found');
+
+    jobDoc.status = 'processing';
+    jobDoc.stage = 'rendering';
+    await jobDoc.save();
+
+    const uuid = crypto.randomUUID();
+    const sourceKey = `documents/source/${uuid}.svg`;
+    await s3.send(
+      new PutObjectCommand({
+        Bucket: bucket,
+        Key: sourceKey,
+        Body: fsSync.createReadStream(svgPath),
+        ContentType: 'image/svg+xml',
+      })
+    );
+
+    const pdfBytes = await svgPathToPdfBytes(svgPath);
+    const renderKey = `documents/original/${uuid}.pdf`;
+    const uploaded = await uploadToS3WithKey(Buffer.from(pdfBytes), 'application/pdf', renderKey);
+
+    const doc = await VectorDocument.create({
+      title,
+      fileKey: uploaded.key,
+      fileUrl: uploaded.url,
+      sourceFileKey: sourceKey,
+      sourceMimeType: 'image/svg+xml',
+      totalPrints: Number(totalPrints || 1),
+      createdBy: userId,
+      mimeType: 'image/svg+xml',
+    });
+
+    const sessionToken = generateSessionToken();
+    await VectorDocumentAccess.create({
+      userId,
+      documentId: doc._id,
+      assignedQuota: Number(totalPrints || 1),
+      usedPrints: 0,
+      printQuota: Number(totalPrints || 1),
+      printsUsed: 0,
+      revoked: false,
+      sessionToken,
+    });
+
+    jobDoc.status = 'completed';
+    jobDoc.stage = 'completed';
+    jobDoc.outputDocumentId = doc._id;
+    jobDoc.totalPages = 1;
+    jobDoc.completedPages = 1;
+    jobDoc.layoutPages = Array.isArray(jobDoc.layoutPages) ? jobDoc.layoutPages : [];
+    jobDoc.layoutPages.push({ type: 'svg-upload-result', documentId: doc._id, ticketCropMm: ticketCropMm || null });
+    await jobDoc.save();
+
+    await fs.unlink(svgPath).catch(() => {});
+    return { ok: true, documentId: doc._id.toString(), sessionToken };
+  } catch (e) {
+    if (jobDoc) {
+      jobDoc.status = 'failed';
+      jobDoc.stage = 'failed';
+      jobDoc.layoutPages = Array.isArray(jobDoc.layoutPages) ? jobDoc.layoutPages : [];
+      jobDoc.layoutPages.push({ type: 'svg-upload-failed', message: e?.message || 'failed' });
+      await jobDoc.save().catch(() => {});
+    }
+    await fs.unlink(svgPath).catch(() => {});
+    throw e;
+  }
+};
 
 export const getVectorFlowProducer = () => {
   if (vectorFlowProducer) return vectorFlowProducer;
@@ -399,16 +586,7 @@ export const startVectorPdfWorkers = () => {
   for (let i = 0; i < count; i += 1) {
     let worker = null;
     try {
-      worker = new Worker(
-        VECTOR_PDF_QUEUE_NAME,
-        async (job) => {
-          if (job.name === 'page') return processPage(job);
-          if (job.name === 'batch') return processBatch(job);
-          if (job.name === 'merge') return processMerge(job);
-          throw new Error(`Unknown job type: ${job.name}`);
-        },
-        { connection, concurrency: 1 }
-      );
+      worker = createWorkerInstance(i);
     } catch (e) {
       if (!warnedRedisUnavailable) {
         warnedRedisUnavailable = true;
@@ -420,6 +598,19 @@ export const startVectorPdfWorkers = () => {
     }
 
     worker.on('failed', async (job, err) => {
+      if (job?.name === 'svg-upload') {
+        const documentJobId = job?.data?.documentJobId;
+        if (!documentJobId) return;
+        const jobDoc = await VectorDocumentJobs.findById(documentJobId).exec().catch(() => null);
+        if (!jobDoc) return;
+        jobDoc.status = 'failed';
+        jobDoc.stage = 'failed';
+        jobDoc.layoutPages = Array.isArray(jobDoc.layoutPages) ? jobDoc.layoutPages : [];
+        jobDoc.layoutPages.push({ type: 'svg-upload-failed', message: err?.message || 'failed' });
+        await jobDoc.save().catch(() => {});
+        return;
+      }
+
       const printJobId = job?.data?.printJobId;
       if (!printJobId) return;
 

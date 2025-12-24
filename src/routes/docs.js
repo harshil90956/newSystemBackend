@@ -1,6 +1,9 @@
 import express from 'express';
 import multer from 'multer';
 import crypto from 'crypto';
+import os from 'os';
+import fs from 'fs/promises';
+import path from 'path';
 import Document from '../vectorModels/VectorDocument.js';
 import DocumentAccess from '../vectorModels/VectorDocumentAccess.js';
 import DocumentJobs from '../vectorModels/VectorDocumentJobs.js';
@@ -8,13 +11,26 @@ import { uploadToS3WithKey, s3, downloadFromS3 } from '../services/s3.js';
 import { GetObjectCommand, PutObjectCommand } from '@aws-sdk/client-s3';
 import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
 import { authMiddleware } from '../middleware/auth.js';
-import { probeInkscape, svgBytesToPdfBytes } from '../vector/vectorLayoutEngine.js';
+import { inkscapeAvailabilityState } from '../vector/vectorLayoutEngine.js';
 import { assertAndConsumePrintQuota } from '../services/printQuotaService.js';
 import { resolveFinalPdfKeyForServe } from '../services/finalPdfExportService.js';
+import { getVectorPdfQueue } from '../../queues/vectorQueue.js';
 // Legacy merge queue removed (vector pipeline generates final PDF in one pass)
 
 const router = express.Router();
-const upload = multer();
+
+const upload = multer({
+  storage: multer.diskStorage({
+    destination: (req, file, cb) => cb(null, os.tmpdir()),
+    filename: (req, file, cb) => {
+      const ext = typeof file?.originalname === 'string' ? path.extname(file.originalname) : '';
+      cb(null, `${crypto.randomUUID()}${ext || ''}`);
+    },
+  }),
+  limits: {
+    fileSize: 500 * 1024 * 1024,
+  },
+});
 
 // Helper to generate opaque session tokens
 const generateSessionToken = () => crypto.randomBytes(32).toString('hex');
@@ -42,7 +58,6 @@ router.post('/upload', authMiddleware, upload.single('file'), async (req, res) =
     const loweredName = title.toLowerCase();
     const isSvg = file.mimetype === 'image/svg+xml' || loweredName.endsWith('.svg');
 
-    const uploadBytes = file.buffer;
     const uploadMime = isSvg ? 'image/svg+xml' : 'application/pdf';
 
     const uuid = crypto.randomUUID();
@@ -53,30 +68,70 @@ router.post('/upload', authMiddleware, upload.single('file'), async (req, res) =
     let sourceMime = null;
 
     if (isSvg) {
-      const ok = await probeInkscape();
-      if (!ok) {
+      if (inkscapeAvailabilityState() === false) {
         return res.status(503).json({ message: 'SVG→PDF rendering is temporarily unavailable' });
       }
 
-      sourceKey = `documents/source/${uuid}.svg`;
-      sourceMime = 'image/svg+xml';
-      await uploadToS3WithKey(uploadBytes, sourceMime, sourceKey);
+      const queue = getVectorPdfQueue();
+      if (!queue) {
+        return res.status(503).json({ message: 'Redis is unavailable. Background jobs are disabled.' });
+      }
 
-      // This key is used by secure-render and may be overwritten with generated PDF bytes.
-      // Keep it separate from the immutable sourceKey.
-      const renderKey = `documents/original/${uuid}.pdf`;
+      let ticketCropMm = null;
+      if (typeof ticketCropMmRaw === 'string' && ticketCropMmRaw.trim()) {
+        try {
+          const parsed = JSON.parse(ticketCropMmRaw);
+          ticketCropMm = parsed && typeof parsed === 'object' ? parsed : null;
+        } catch {
+          ticketCropMm = null;
+        }
+      }
 
-      const pdfBytes = await svgBytesToPdfBytes(uploadBytes);
-      const uploaded = await uploadToS3WithKey(Buffer.from(pdfBytes), 'application/pdf', renderKey);
-      key = uploaded.key;
-      url = uploaded.url;
+      const jobDoc = await DocumentJobs.create({
+        email: req.user.email,
+        assignedQuota: parsedTotal,
+        layoutPages: [
+          {
+            type: 'svg-upload',
+            title,
+            totalPrints: parsedTotal,
+            svgPath: file.path,
+            ticketCropMm,
+          },
+        ],
+        totalPages: 0,
+        completedPages: 0,
+        userId: req.user._id,
+        outputDocumentId: null,
+        status: 'pending',
+        stage: 'pending',
+        createdBy: req.user._id,
+      });
+
+      await queue.add(
+        'svg-upload',
+        {
+          documentJobId: jobDoc._id.toString(),
+          svgPath: file.path,
+          title,
+          totalPrints: parsedTotal,
+          userId: req.user._id.toString(),
+          email: req.user.email,
+          ticketCropMm,
+        },
+        { attempts: 1, removeOnComplete: true, removeOnFail: false }
+      );
+
+      return res.status(202).json({ jobId: jobDoc._id.toString(), status: 'queued' });
     } else {
+      const uploadBytes = await fs.readFile(file.path);
       const originalKey = `documents/original/${uuid}.pdf`;
       const uploaded = await uploadToS3WithKey(uploadBytes, uploadMime, originalKey);
       key = uploaded.key;
       url = uploaded.url;
       sourceKey = uploaded.key;
       sourceMime = uploadMime;
+      await fs.unlink(file.path).catch(() => {});
     }
 
     const doc = await Document.create({
