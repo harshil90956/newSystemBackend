@@ -83,6 +83,7 @@ app.get('/api/health', (req, res) => {
   res.json({
     status: 'ok',
     workersEnabled: envBool('ENABLE_WORKERS', false),
+    ipSecurityEnabled: false,
     redisAvailable: Boolean(flowProducer),
     inkscapeAvailable: inkscapeAvailabilityState() === true,
   });
