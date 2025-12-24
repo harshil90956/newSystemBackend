@@ -21,7 +21,7 @@ COPY . ./
 
 ENV NODE_ENV=production
 
-EXPOSE 4000
+EXPOSE 8000
 
 ENTRYPOINT ["/usr/bin/tini", "--"]
 
