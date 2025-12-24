@@ -262,7 +262,13 @@ router.get('/:documentId/raw-svg', authMiddleware, async (req, res) => {
 // Secure render: stream PDF/SVG bytes based on session token
 router.post('/secure-render', authMiddleware, async (req, res) => {
   try {
-    const { sessionToken, requestId } = req.body;
+    const { sessionToken: sessionTokenRaw, auth_token: authTokenRaw, requestId } = req.body;
+    const sessionToken =
+      (typeof sessionTokenRaw === 'string' && sessionTokenRaw.trim())
+        ? sessionTokenRaw.trim()
+        : (typeof authTokenRaw === 'string' && authTokenRaw.trim())
+          ? authTokenRaw.trim()
+          : '';
 
     if (!sessionToken) {
       return res.status(400).json({ message: 'sessionToken is required' });
